@@ -1,65 +1,133 @@
-// index.js
-const express = require('express');
-const sqlite3 = require('sqlite3');
-const bodyParser = require('body-parser');
-const { v4: uuidv4 } = require('uuid');
+import express from "express";
+import bodyParser from "body-parser";
+import cors from "cors";
+import pkg from "pg";
+import dotenv from "dotenv";
+import { v4 as uuidv4 } from "uuid";
+
+dotenv.config();
+const { Pool } = pkg;
+
 const app = express();
+app.use(cors());
 app.use(bodyParser.json());
 
-
-const DB = new sqlite3.Database('./db.sqlite');
-
-
-// helper: run a statement as promise
-function run(db, sql, params=[]) {
-return new Promise((resolve, reject) => db.run(sql, params, function(err){
-if (err) return reject(err);
-resolve({ id: this.lastID });
-}));
-}
-function all(db, sql, params=[]) {
-return new Promise((resolve, reject) => db.all(sql, params, (err, rows)=>{
-if (err) return reject(err);
-resolve(rows);
-}));
-}
-function get(db, sql, params=[]) {
-return new Promise((resolve, reject) => db.get(sql, params, (err, row)=>{
-if (err) return reject(err);
-resolve(row);
-}));
-}
-
-
-// init (create tables if not exists)
-const fs = require('fs');
-const migration = fs.readFileSync('./migrations/001_init.sql', 'utf8');
-DB.exec(migration, (err)=>{ if (err) console.error('migration error', err); else console.log('db ready'); });
-
-
-// create goal
-app.post('/api/goals', async (req, res) => {
-try {
-const { title, recipient_name, target_amount, currency='EUR', due_date } = req.body;
-const reference_code = uuidv4().slice(0,8).toUpperCase();
-const sql = `INSERT INTO goals (title, recipient_name, target_amount, currency, created_by, reference_code, due_date) VALUES (?,?,?,?,?,?,?)`;
-const r = await run(DB, sql, [title, recipient_name, target_amount, currency, null, reference_code, due_date]);
-const id = r.id;
-const goal = await get(DB, 'SELECT * FROM goals WHERE id=?', [id]);
-res.json(goal);
-} catch (e) { console.error(e); res.status(500).json({error: e.message}); }
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
 });
 
+// 🟢 ایجاد هدف
+app.post("/api/goals", async (req, res) => {
+  try {
+    const { title, recipient_name, target_amount, currency = "EUR", due_date } =
+      req.body;
+    const reference_code = uuidv4().slice(0, 8).toUpperCase();
 
-// get goal with totals and contributors
-app.get('/api/goals/:id', async (req, res) => {
-try {
-const id = req.params.id;
-const goal = await get(DB, 'SELECT * FROM goals WHERE id=?', [id]);
-if (!goal) return res.status(404).json({error:'not found'});
-const contributors = await all(DB, 'SELECT * FROM contributors WHERE goal_id=?', [id]);
-const payments = await all(DB, 'SELECT * FROM payments WHERE goal_id=?', [id]);
-const totalPaid = payments.reduce((s,p)=>s+Number(p.amount),0);
-res.json({ ...goal, contributors, payments, totalPaid, remaining: Number(goal.target_amount) - totalPaid });
-} catch(e){ console.error(e); res.status(500).json({error:e.message}); }
-app.listen(4000, ()=>console.log('Backend listening on http://localhost:4000'));
+    const result = await pool.query(
+      `INSERT INTO goals (title, recipient_name, target_amount, currency, reference_code, due_date)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [title, recipient_name, target_amount, currency, reference_code, due_date]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error creating goal" });
+  }
+});
+
+// 🟢 دریافت وضعیت هدف
+app.get("/api/goals/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const goalRes = await pool.query("SELECT * FROM goals WHERE id=$1", [id]);
+    if (goalRes.rows.length === 0)
+      return res.status(404).json({ error: "Goal not found" });
+    const goal = goalRes.rows[0];
+
+    const contribRes = await pool.query(
+      "SELECT * FROM contributors WHERE goal_id=$1",
+      [id]
+    );
+    const payRes = await pool.query(
+      "SELECT * FROM payments WHERE goal_id=$1",
+      [id]
+    );
+
+    const totalPaid = payRes.rows.reduce((sum, p) => sum + Number(p.amount), 0);
+
+    res.json({
+      ...goal,
+      contributors: contribRes.rows,
+      payments: payRes.rows,
+      totalPaid,
+      remaining: Number(goal.target_amount) - totalPaid,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error fetching goal" });
+  }
+});
+
+// 🟢 اضافه کردن مشارکت‌کننده
+app.post("/api/goals/:id/contributors", async (req, res) => {
+  try {
+    const goal_id = req.params.id;
+    const { name, email, phone, committed_amount } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO contributors (goal_id, name, email, phone, committed_amount)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [goal_id, name, email, phone, committed_amount]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error adding contributor" });
+  }
+});
+
+// 🟢 ثبت پرداخت
+app.post("/api/goals/:id/payments", async (req, res) => {
+  try {
+    const goal_id = req.params.id;
+    const { contributor_id, amount, method, notes } = req.body;
+
+    const payRes = await pool.query(
+      `INSERT INTO payments (goal_id, contributor_id, amount, method, notes)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [goal_id, contributor_id, amount, method, notes]
+    );
+
+    // بررسی تکمیل هدف
+    const sumRes = await pool.query(
+      "SELECT SUM(amount) AS total FROM payments WHERE goal_id=$1",
+      [goal_id]
+    );
+    const totalPaid = sumRes.rows[0].total || 0;
+
+    const goalRes = await pool.query("SELECT * FROM goals WHERE id=$1", [
+      goal_id,
+    ]);
+    const goal = goalRes.rows[0];
+
+    if (totalPaid >= Number(goal.target_amount) && goal.status !== "completed") {
+      await pool.query("UPDATE goals SET status='completed' WHERE id=$1", [
+        goal_id,
+      ]);
+    }
+
+    res.json({ payment: payRes.rows[0], totalPaid });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error recording payment" });
+  }
+});
+
+// 🟢 سلامت
+app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+const port = process.env.PORT || 4000;
+app.listen(port, () => console.log(`Backend running on port ${port}`));
